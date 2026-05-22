@@ -31,10 +31,9 @@ function buildProxyLine(proxy) {
             extras.push(`obfs=${proxy.obfs || opts.mode}`);
             if (proxy['obfs-host'] || opts.host) extras.push(`obfs-host=${proxy['obfs-host'] || opts.host}`);
         } else if (plugin === 'v2ray-plugin' || opts.mode === 'websocket') {
-            extras.push('obfs=ws');
+            extras.push((opts.tls || opts.mode === 'websocket-tls') ? 'obfs=wss' : 'obfs=ws');
             if (opts.path) extras.push(`obfs-uri=${opts.path}`);
             if (opts.host) extras.push(`obfs-host=${opts.host}`);
-            if (opts.tls || opts.mode === 'websocket-tls') extras.push('over-tls=true');
         }
         if (proxy.udp) extras.push('udp-relay=true');
         return `shadowsocks=${server}:${port}, method=${proxy.cipher || 'aes-128-gcm'}, password=${proxy.password || ''}${extras.length ? `, ${extras.join(', ')}` : ''}, tag=${name}`;
@@ -57,17 +56,40 @@ function buildProxyLine(proxy) {
         return `vmess=${server}:${port}, method=${normalizeQxVmessMethod(proxy.cipher)}, password=${proxy.uuid || ''}${extras.length ? `, ${extras.join(', ')}` : ''}, tag=${name}`;
     }
     if (type === 'vless') {
-        const extras = [];
-        if (proxy.network === 'ws') {
-            extras.push('obfs=ws');
+        const extras = ['method=none'];
+        const transport = proxy.network || 'tcp';
+        const isReality = proxy.security === 'reality' || !!proxy['reality-opts'];
+        const hasTlsLayer = proxy.tls || isReality;
+        const hostValue = proxy.sni ?? proxy.servername;
+
+        if (transport === 'ws' || proxy['ws-opts']) {
+            extras.push(hasTlsLayer ? 'obfs=wss' : 'obfs=ws');
             const wsOpts = proxy['ws-opts'] || proxy.wsOpts;
-            if (wsOpts?.path) extras.push(`obfs-uri=${wsOpts.path}`);
             if (wsOpts?.headers?.Host) extras.push(`obfs-host=${wsOpts.headers.Host}`);
-        } else {
-            extras.push('over-tls=true');
+            else if (hostValue !== undefined) extras.push(`obfs-host=${hostValue}`);
+            if (wsOpts?.path) extras.push(`obfs-uri=${wsOpts.path}`);
+        } else if (transport === 'grpc' || proxy['grpc-opts']) {
+            extras.push(hasTlsLayer ? 'obfs=over-tls' : 'obfs=grpc');
+            if (hostValue !== undefined) extras.push(`obfs-host=${hostValue}`);
+            const grpcOpts = proxy['grpc-opts'] || proxy.grpcOpts;
+            if (!hasTlsLayer && grpcOpts?.['grpc-service-name']) extras.push(`obfs-uri=${grpcOpts['grpc-service-name']}`);
+        } else if (transport === 'xhttp' || proxy['xhttp-opts']) {
+            extras.push(hasTlsLayer ? 'obfs=over-tls' : 'obfs=http');
+            const xhttpOpts = proxy['xhttp-opts'] || proxy.xhttpOpts;
+            if (xhttpOpts?.host) extras.push(`obfs-host=${xhttpOpts.host}`);
+            else if (hostValue !== undefined) extras.push(`obfs-host=${hostValue}`);
+            if (!hasTlsLayer && xhttpOpts?.path) extras.push(`obfs-uri=${xhttpOpts.path}`);
+        } else if (hasTlsLayer) {
+            extras.push('obfs=over-tls');
+            if (hostValue !== undefined) extras.push(`obfs-host=${hostValue}`);
         }
-        const sni = proxy.servername ?? proxy.sni;
-        if (sni !== undefined) extras.push(`tls-host=${sni}`);
+
+        if (isReality) {
+            const realityOpts = proxy['reality-opts'] || {};
+            if (realityOpts['public-key']) extras.push(`reality-base64-pubkey=${realityOpts['public-key']}`);
+            if (realityOpts['short-id']) extras.push(`reality-hex-shortid=${realityOpts['short-id']}`);
+        }
+        if (proxy.flow) extras.push(`flow=${proxy.flow}`);
         if (proxy['skip-cert-verify'] === true || proxy.skipCertVerify === true) extras.push('tls-verification=false');
         return `vless=${server}:${port}, password=${proxy.uuid || ''}${extras.length ? `, ${extras.join(', ')}` : ''}, tag=${name}`;
     }
@@ -89,7 +111,8 @@ function buildProxyLine(proxy) {
         if (proxy.password) extras.push(proxy.password || '');
         const sni = proxy.servername ?? proxy.sni;
         if (sni !== undefined) extras.push(`sni=${sni}`);
-        if (proxy['congestion-control']) extras.push(`congestion-controller=${proxy['congestion-control']}`);
+        const congestionControl = proxy['congestion-control'] || proxy['congestion-controller'];
+        if (congestionControl) extras.push(`congestion-controller=${congestionControl}`);
         if (proxy['udp-relay-mode']) extras.push(`udp-relay=${proxy['udp-relay-mode']}`);
         if (proxy.alpn) {
             const alpn = Array.isArray(proxy.alpn) ? proxy.alpn.join(',') : proxy.alpn;
@@ -118,20 +141,21 @@ function buildPolicyLine(group) {
     const members = (['url-test', 'fallback', 'load-balance'].includes(type)
         ? rawMembers.filter(member => !['DIRECT', 'REJECT', 'REJECT-DROP', 'PASS'].includes(String(member).toUpperCase()))
         : rawMembers).join(', ');
-    const filter = Array.isArray(group.filters) && group.filters.length > 0 ? group.filters.join('|') : '';
-    const tolerance = group.options?.tolerance;
-    if (type === 'url-test') {
-        const base = filter ? `${group.name} = url-test, ${members}, url=${group.options?.url || 'http://www.gstatic.com/generate_204'}, interval=${group.options?.interval || 300}, filter=${filter}` : `${group.name} = url-test, ${members}, url=${group.options?.url || 'http://www.gstatic.com/generate_204'}, interval=${group.options?.interval || 300}`;
-        return tolerance ? `${base}, tolerance=${tolerance}` : base;
+    const tolerance = group.options?.tolerance || 50;
+    const interval = group.options?.interval || 300;
+    
+    if (type === 'url-test' || type === 'url-latency-benchmark') {
+        return `url-latency-benchmark=${group.name}, ${members}, check-interval=${interval}, tolerance=${tolerance}`;
     }
-    if (type === 'fallback') {
-        const base = filter ? `${group.name} = fallback, ${members}, url=${group.options?.url || 'http://www.gstatic.com/generate_204'}, interval=${group.options?.interval || 300}, filter=${filter}` : `${group.name} = fallback, ${members}, url=${group.options?.url || 'http://www.gstatic.com/generate_204'}, interval=${group.options?.interval || 300}`;
-        return tolerance ? `${base}, tolerance=${tolerance}` : base;
+    if (type === 'fallback' || type === 'available') {
+        return `available=${group.name}, ${members}`;
     }
     if (type === 'load-balance') {
-        return filter ? `${group.name} = load-balance, ${members}, url=${group.options?.url || 'http://www.gstatic.com/generate_204'}, interval=${group.options?.interval || 300}, filter=${filter}` : `${group.name} = load-balance, ${members}`;
+        // Quantumult X round-robin/load-balance isn't natively identical, but 'available' or 'static' is usually the fallback.
+        // Or we can just fallback to static
+        return `static=${group.name}, ${members}`;
     }
-    return `${group.name} = select, ${members}`;
+    return `static=${group.name}, ${members}`;
 }
 
 function buildRuleLine(rule) {
@@ -166,6 +190,16 @@ export function renderQuanxFromTemplateModel(model, options = {}) {
     const localRules = normalizedModel.rules.filter(r => !remoteRules.includes(r));
 
     return [
+        '[general]',
+        '; 监听端口',
+        'network_check_url=http://www.gstatic.com/generate_204',
+        'server_check_url=http://www.gstatic.com/generate_204',
+        '',
+        '[dns]',
+        'no-ipv6',
+        'server = 223.5.5.5',
+        'server = 114.114.114.114',
+        '',
         '[server_local]',
         ...proxies.map(buildProxyLine).filter(Boolean),
         '',
